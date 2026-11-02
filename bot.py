@@ -2,8 +2,8 @@
 Telegram Ban-Word Bot
 - Auto-deletes group messages that contain banned words / spam commands (e.g. /masuk, /join)
 - Ban list per group stored in Supabase (table: banned_words)
-- Deletions logged in Supabase (table: delete_log) for /status
-- Admin commands: /addban, /delban, /listban, /status
+- Deletions logged in Supabase (table: delete_log) for /banstatus
+- Admin commands: /addban, /delban, /listban, /banstatus
 """
 import asyncio
 import logging
@@ -14,7 +14,9 @@ import time
 from supabase import create_client
 from telegram import MessageEntity, Update
 from telegram.error import Conflict, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application, ApplicationHandlerStop, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters,
+)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -39,9 +41,23 @@ try:
 except ValueError:
     CACHE_TTL = 60
 
+def _parse_ids(raw: str) -> set[int]:
+    ids = set()
+    for part in raw.replace(" ", "").split(","):
+        if part:
+            try:
+                ids.add(int(part))
+            except ValueError:
+                log.warning("Ignoring bad ALLOWED_CHATS entry: %r", part)
+    return ids
+
+
+# empty = bot works in every group; set = only these groups, leaves any other
+ALLOWED_CHATS = _parse_ids(os.getenv("ALLOWED_CHATS", ""))
+
 TABLE = "banned_words"
 LOG_TABLE = "delete_log"
-OWN_COMMANDS = ("addban", "delban", "listban", "status", "start", "help")
+OWN_COMMANDS = ("addban", "delban", "listban", "banstatus", "banhelp", "start", "help")
 START_TIME = time.time()
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -100,6 +116,12 @@ async def get_bans(chat_id: int, fresh: bool = False) -> set[str]:
 
 # ---------- matching ----------
 def _pattern(word: str) -> re.Pattern:
+    # wildcard: "/masuk*" = any command starting with /masuk, "judi*" = any word starting with judi
+    if word.endswith("*") and len(word) > 1:
+        base = re.escape(word[:-1])
+        if word.startswith("/"):
+            return re.compile(rf"(?<!\S){base}\w*(?:@\w+)?(?![\w/])", re.I)
+        return re.compile(rf"(?<!\w){base}\w*", re.I)
     w = re.escape(word)
     if word.startswith("/"):
         # the command as its own token anywhere in the text, also /join@SomeBot
@@ -186,9 +208,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Add me to a group as admin with 'Delete messages' permission.\n\n"
         "Admin commands (in the group):\n"
         "/addban /masuk /join promo – add words\n"
+        "/addban /masuk* – any command starting with /masuk\n"
         "/delban promo – remove words\n"
         "/listban – show the list\n"
-        "/status – bot health & stats"
+        "/banstatus – bot health & stats"
     )
 
 
@@ -241,7 +264,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime = _fmt_uptime(time.time() - START_TIME)
     if chat.type == "private":
         return await update.effective_message.reply_text(
-            f"🟢 Bot online · ⏱ {uptime}\nUse /status inside a group for group stats."
+            f"🟢 Bot online · ⏱ {uptime}\nUse /banstatus inside a group for group stats."
         )
     if not await is_admin(update, context):
         return
@@ -277,12 +300,29 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 Commands (admins only)\n"
         "/addban word1 word2 – ban words\n"
         "   e.g. /addban /daftar promo t.me/\n"
+        "   /masuk* = any command starting with /masuk\n"
         "/delban word – unban a word\n"
         "   e.g. /delban promo\n"
         "/listban – show all banned words\n"
-        "/status – show this status\n"
-        "/help – how to use the bot"
+        "/banstatus – show this status\n"
+        "/banhelp – how to use the bot"
     )
+
+
+# ---------- group allowlist ----------
+async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs before everything. Leaves groups that are not in ALLOWED_CHATS."""
+    chat = update.effective_chat
+    if not ALLOWED_CHATS or not chat or chat.type == "private":
+        return
+    if chat.id in ALLOWED_CHATS:
+        return
+    log.warning("Not allowed: %s (%s) – leaving", chat.id, getattr(chat, "title", ""))
+    try:
+        await context.bot.leave_chat(chat.id)
+    except TelegramError as e:
+        log.warning("Could not leave %s: %s", chat.id, e)
+    raise ApplicationHandlerStop
 
 
 # ---------- the filter ----------
@@ -328,11 +368,12 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler(["start", "help"], cmd_start), group=0)
+    app.add_handler(TypeHandler(Update, gate), group=-1)
+    app.add_handler(CommandHandler(["start", "banhelp"], cmd_start), group=0)
     app.add_handler(CommandHandler("addban", cmd_addban), group=0)
     app.add_handler(CommandHandler("delban", cmd_delban), group=0)
     app.add_handler(CommandHandler("listban", cmd_listban), group=0)
-    app.add_handler(CommandHandler("status", cmd_status), group=0)
+    app.add_handler(CommandHandler("banstatus", cmd_status), group=0)
     app.add_handler(
         MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), filter_messages),
         group=1,
@@ -344,6 +385,7 @@ def build_app() -> Application:
 def main():
     app = build_app()
     log.info("Bot starting. Default bans: %s | admins exempt: %s", ", ".join(sorted(DEFAULT_BANS)), EXEMPT_ADMINS)
+    log.info("Allowed groups: %s", ", ".join(map(str, sorted(ALLOWED_CHATS))) or "ALL")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
