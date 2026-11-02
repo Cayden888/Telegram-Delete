@@ -12,7 +12,7 @@ import time
 
 from supabase import create_client
 from telegram import Update
-from telegram.error import TelegramError
+from telegram.error import Conflict, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -58,10 +58,10 @@ def _db_log(chat_id: int, user_id, word: str) -> None:
 
 def _db_stats(chat_id: int) -> tuple[int, int]:
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
-    total = sb.table(LOG_TABLE).select("id", count="exact", head=True).eq("chat_id", chat_id).execute().count or 0
+    total = sb.table(LOG_TABLE).select("id", count="exact").eq("chat_id", chat_id).limit(1).execute().count or 0
     day = (
-        sb.table(LOG_TABLE).select("id", count="exact", head=True)
-        .eq("chat_id", chat_id).gte("created_at", since).execute().count or 0
+        sb.table(LOG_TABLE).select("id", count="exact")
+        .eq("chat_id", chat_id).gte("created_at", since).limit(1).execute().count or 0
     )
     return total, day
 
@@ -259,6 +259,14 @@ async def filter_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Could not delete (is the bot admin with delete rights?): %s", e)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, Conflict):
+        log.warning("Another bot instance is polling (normal for a few seconds during redeploy).")
+        return
+    log.error("Unhandled error: %s", err, exc_info=err)
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start), group=0)
@@ -270,6 +278,7 @@ def main():
         MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), filter_messages),
         group=1,
     )
+    app.add_error_handler(on_error)
     log.info("Bot running. Default bans: %s", ", ".join(sorted(DEFAULT_BANS)))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
