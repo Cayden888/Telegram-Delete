@@ -272,7 +272,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛡 Permission: {perm_line}\n"
         f"🚫 Banned words: {len(bans)}\n"
         f"🧹 Deleted: {deleted}\n"
-        f"👮 Admins exempt: {'yes' if EXEMPT_ADMINS else 'no'}"
+        f"👮 Admins exempt: {'yes' if EXEMPT_ADMINS else 'no'}\n"
+        "\n"
+        "📝 Commands (admins only)\n"
+        "/addban word1 word2 – ban words\n"
+        "   e.g. /addban /daftar promo t.me/\n"
+        "/delban word – unban a word\n"
+        "   e.g. /delban promo\n"
+        "/listban – show all banned words\n"
+        "/status – show this status\n"
+        "/help – how to use the bot"
     )
 
 
