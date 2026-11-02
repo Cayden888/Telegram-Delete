@@ -2,7 +2,7 @@
 Telegram Ban-Word Bot
 - Auto-deletes group messages that contain banned words / spam commands (e.g. /masuk, /join)
 - Ban list per group stored in Supabase
-- Admin commands: /addban, /delban, /listban
+- Admin commands: /addban, /delban, /listban, /status
 """
 import asyncio
 import logging
@@ -29,7 +29,9 @@ CACHE_TTL = int(os.getenv("CACHE_TTL", "60"))
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 TABLE = "banned_words"
-OWN_COMMANDS = ("/addban", "/delban", "/listban", "/start", "/help")
+LOG_TABLE = "delete_log"
+OWN_COMMANDS = ("/addban", "/delban", "/listban", "/status", "/start", "/help")
+START_TIME = time.time()
 
 _ban_cache: dict[int, tuple[set[str], float]] = {}
 _admin_cache: dict[int, tuple[set[int], float]] = {}
@@ -48,6 +50,28 @@ def _db_add(chat_id: int, words: list[str], user_id: int) -> None:
 
 def _db_del(chat_id: int, words: list[str]) -> None:
     sb.table(TABLE).delete().eq("chat_id", chat_id).in_("word", words).execute()
+
+
+def _db_log(chat_id: int, user_id, word: str) -> None:
+    sb.table(LOG_TABLE).insert({"chat_id": chat_id, "user_id": user_id, "word": word}).execute()
+
+
+def _db_stats(chat_id: int) -> tuple[int, int]:
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+    total = sb.table(LOG_TABLE).select("id", count="exact", head=True).eq("chat_id", chat_id).execute().count or 0
+    day = (
+        sb.table(LOG_TABLE).select("id", count="exact", head=True)
+        .eq("chat_id", chat_id).gte("created_at", since).execute().count or 0
+    )
+    return total, day
+
+
+def _fmt_uptime(sec: float) -> str:
+    sec = int(sec)
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m, _ = divmod(sec, 60)
+    return (f"{d}d " if d else "") + f"{h}h {m}m"
 
 
 async def get_bans(chat_id: int) -> set[str]:
@@ -122,7 +146,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Admin commands (in the group):\n"
         "/addban /masuk /join promo  – add words\n"
         "/delban promo  – remove words\n"
-        "/listban  – show the list"
+        "/listban  – show the list\n"
+        "/status  – bot health & stats"
     )
 
 
@@ -166,6 +191,48 @@ async def cmd_listban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("🚫 Banned words:\n" + ("\n".join(bans) or "(none)"))
 
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    uptime = _fmt_uptime(time.time() - START_TIME)
+    if chat.type == "private":
+        return await update.effective_message.reply_text(
+            f"🟢 Bot online\n⏱ Uptime: {uptime}\nUse /status inside a group for group stats."
+        )
+    if not await is_admin(update, context):
+        return
+
+    # database + stats
+    try:
+        total, day = await asyncio.to_thread(_db_stats, chat.id)
+        db_line = "✅ connected"
+    except Exception as e:
+        log.error("Status DB check failed: %s", e)
+        total = day = None
+        db_line = "❌ error (check SUPABASE_URL / KEY / schema.sql)"
+
+    # bot permission in this group
+    try:
+        me = await context.bot.get_chat_member(chat.id, context.bot.id)
+        can_delete = me.status == "creator" or (me.status == "administrator" and getattr(me, "can_delete_messages", False))
+    except TelegramError:
+        can_delete = False
+    perm_line = "✅ can delete" if can_delete else "❌ make me admin with 'Delete messages'"
+
+    _ban_cache.pop(chat.id, None)
+    bans = await get_bans(chat.id)
+    deleted = f"{day} in 24h · {total} total" if total is not None else "n/a"
+
+    await update.effective_message.reply_text(
+        "📊 Bot status\n"
+        f"🟢 Online · ⏱ {uptime}\n"
+        f"🗄 Database: {db_line}\n"
+        f"🛡 Permission: {perm_line}\n"
+        f"🚫 Banned words: {len(bans)}\n"
+        f"🧹 Deleted: {deleted}\n"
+        f"👮 Admins exempt: {'yes' if EXEMPT_ADMINS else 'no'}"
+    )
+
+
 async def filter_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg:
@@ -182,8 +249,12 @@ async def filter_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await msg.delete()
-        who = update.effective_user.id if update.effective_user else "?"
+        who = update.effective_user.id if update.effective_user else None
         log.info("Deleted msg in %s from %s (matched %r)", msg.chat_id, who, hit)
+        try:
+            await asyncio.to_thread(_db_log, msg.chat_id, who, hit)
+        except Exception as e:
+            log.warning("Could not log deletion: %s", e)
     except TelegramError as e:
         log.warning("Could not delete (is the bot admin with delete rights?): %s", e)
 
@@ -194,6 +265,7 @@ def main():
     app.add_handler(CommandHandler("addban", cmd_addban), group=0)
     app.add_handler(CommandHandler("delban", cmd_delban), group=0)
     app.add_handler(CommandHandler("listban", cmd_listban), group=0)
+    app.add_handler(CommandHandler("status", cmd_status), group=0)
     app.add_handler(
         MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), filter_messages),
         group=1,
